@@ -14,8 +14,10 @@
 # limitations under the License.
 """
 
+from __future__ import annotations
+
 import os
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable
 
 import paddle
 from paddle import nn
@@ -23,7 +25,6 @@ from paddleformers.utils.log import logger
 
 import fastdeploy
 from fastdeploy import envs
-from fastdeploy.model_executor.layers.moe import FusedMoE
 from fastdeploy.model_executor.layers.moe.fused_moe_backend_base import MoEMethodBase
 from fastdeploy.model_executor.utils import (
     create_parameter_and_copy,
@@ -31,416 +32,25 @@ from fastdeploy.model_executor.utils import (
     set_weight_attrs,
 )
 
-from .quant_base import QuantConfigBase, QuantMethodBase
+# Import helper functions and config from nvfp4.
+# nvfp4.py appends `from .nvfp4_ep import ModelOptNvFp4FusedMoEDispatch` at its
+# end (after all helpers are defined), so these names are available in the
+# partially-loaded module when this module is first imported.
+from .nvfp4 import (
+    ModelOptNvFp4Config,
+    _get_cute_dtype,
+    _perm,
+    _process_scale_interleaved,
+    call_depermute_prefill_combine,
+    call_prefill_permute_to_masked_gemm,
+    next_power_of_2,
+)
 
-paddle.compat.enable_torch_proxy(scope={"flashinfer"})
-
-try:
-    from fastdeploy.model_executor.ops.gpu import (
-        depermute_prefill_combine,
-        prefill_permute_to_masked_gemm,
-    )
-except ImportError:
+if TYPE_CHECKING:
     pass
 
 
-def call_prefill_permute_to_masked_gemm(
-    x: paddle.Tensor,
-    scale: paddle.Tensor,
-    topk_ids: paddle.Tensor,
-    num_local_experts: int,
-    max_token_num: int,
-):
-    """
-    Permute input tokens and scales from token-major to expert-major layout
-    for MoE masked GEMM operations.
-
-    Args:
-        x: Input hidden states [num_tokens, hidden].
-        scale: Input scales [num_tokens, hidden_scale].
-        topk_ids: Expert routing indices [num_tokens, topk] (int64 or int32).
-        num_local_experts: Number of local experts on this device.
-        max_token_num: Maximum tokens per expert buffer.
-
-    Returns:
-        tuple: (permute_x, permute_scale, permuted_indice_map, token_nums_per_expert)
-    """
-    if topk_ids.dtype != paddle.int64:
-        topk_ids = topk_ids.cast(paddle.int64)
-
-    results = prefill_permute_to_masked_gemm(x, scale, topk_ids, num_local_experts, max_token_num)
-
-    return results[0], results[1], results[2], results[3]
-
-
-def call_depermute_prefill_combine(
-    x: paddle.Tensor,
-    indice_map: paddle.Tensor,
-    topk_weights: paddle.Tensor,
-    num_worst_tokens: int,
-):
-    """
-    Depermute and combine expert outputs back to token-major layout.
-
-    Args:
-        x: Expert outputs [num_local_experts, max_tokens_per_expert, hidden].
-        indice_map: Flat index tensor [num_worst_tokens, topk] (int32).
-        topk_weights: Combination weights [num_worst_tokens, topk] (float32).
-        num_worst_tokens: Number of output tokens to produce.
-
-    Returns:
-        depermuted_x: Combined output [num_worst_tokens, hidden].
-    """
-    results = depermute_prefill_combine(x, indice_map, topk_weights, num_worst_tokens)
-
-    return results
-
-
-def _perm(tensor, *dims):
-    try:
-        return tensor.transpose(list(dims))
-    except TypeError:
-        return tensor.permute(*dims)
-
-
-def _get_cute_dtype(input_tensor) -> str:
-    s = str(input_tensor.dtype).split(".")[-1]
-    if s == "bfloat16":
-        return "bfloat16"
-    if s == "float16":
-        return "float16"
-    if s == "float32":
-        return "float32"
-    raise ValueError(f"Unsupported cute dtype {input_tensor.dtype}")
-
-
-def next_power_of_2(n: int):
-    return 1 << (n - 1).bit_length() if n > 0 else 1
-
-
-def _process_scale_interleaved(scales):
-    scale_dim = len(scales.shape)
-    if scale_dim == 2:
-        scales = scales.unsqueeze(0)
-    assert len(scales.shape) == 3
-    B, M, K = scales.shape
-    round_up_multiple = lambda x, m: (x + m - 1) // m * m
-    M_padded = round_up_multiple(M, 128)
-    K_padded = round_up_multiple(K, 4)
-    padded_scales = paddle.empty([B, M_padded, K_padded], dtype=scales.dtype)
-    padded_scales[:B, :M, :K].copy_(scales)
-    batches, rows, cols = padded_scales.shape
-    assert rows % 128 == 0
-    assert cols % 4 == 0
-    padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
-    padded_scales = padded_scales.transpose([0, 1, 4, 3, 2, 5])
-    # [batches, rows // 128, cols // 4, 32, 4, 4]
-
-    padded_scales = padded_scales.contiguous().to(paddle.device.get_device())
-    padded_scales = (
-        padded_scales.reshape(M_padded, K_padded) if scale_dim == 2 else padded_scales.reshape(B, M_padded, K_padded)
-    )
-    return padded_scales
-
-
-class ModelOptNvFp4Config(QuantConfigBase):
-    """
-    quantization config for ModelOpt Nvfp4 datatype
-    """
-
-    def __init__(
-        self,
-        is_checkpoint_nvfp4_serialized: bool,
-        kv_cache_quant_algo: str | None,
-        exclude_modules: list[str],
-        group_size: int = 16,
-        is_checkpoint_bf16: bool = False,
-        use_fp4_dispatch: bool = False,
-    ) -> None:
-        self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
-        if is_checkpoint_nvfp4_serialized:
-            logger.warning(
-                "Detected ModelOpt NVFP4 checkpoint. Please note that"
-                " the format is experimental and could change in future."
-            )
-
-            self.group_size = group_size
-            self.kv_cache_quant_algo = kv_cache_quant_algo
-            self.exclude_modules = exclude_modules
-
-        self.quant_max_bound = 6
-        self.quant_min_bound = -6
-        self.quant_round_type = 1
-        self.is_checkpoint_bf16 = is_checkpoint_bf16
-        self.use_fp4_dispatch = use_fp4_dispatch
-
-    def name(self) -> str:
-        return "modelopt_fp4"
-
-    @classmethod
-    def from_config(cls, config: dict) -> "ModelOptNvFp4Config":
-        quant_config = config
-        quant_method = quant_config.get("quant_algo", "")
-        if not quant_method:
-            raise ValueError("Missing 'quant_algo' in quantization config")
-
-        # Handle kv_cache_quant_algo with proper type validation
-        kv_cache_quant_algo_raw = quant_config.get("kv_cache_quant_algo")
-        if kv_cache_quant_algo_raw is None:
-            # No KV cache quantization by default
-            kv_cache_quant_algo = None
-        elif isinstance(kv_cache_quant_algo_raw, str):
-            kv_cache_quant_algo = kv_cache_quant_algo_raw
-        else:
-            raise ValueError(f"kv_cache_quant_algo must be a string, got " f"{type(kv_cache_quant_algo_raw)}")
-
-        # Handle group_size with proper type validation
-        group_size_raw = quant_config.get("group_size")
-        if group_size_raw is None:
-            group_size = 16  # Default value
-        elif isinstance(group_size_raw, int):
-            group_size = group_size_raw
-        else:
-            try:
-                group_size = int(group_size_raw)
-            except (ValueError, TypeError):
-                raise ValueError(f"group_size must be an integer, got {type(group_size_raw)}") from None
-
-        # "exclude_modules" is the key in the legacy hf_quant_config.json
-        exclude_modules = quant_config.get("exclude_modules", [])
-        if not isinstance(exclude_modules, list):
-            raise ValueError(f"exclude_modules must be a list, got {type(exclude_modules)}")
-
-        is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
-
-        # For FP4, these fields are required
-        if is_checkpoint_nvfp4_serialized and "quantization" in config:
-            # Check if required fields are present in the quantization config
-            quant_config = config["quantization"]
-            required_fields = ["group_size", "kv_cache_quant_algo", "exclude_modules"]
-            missing_fields = [field for field in required_fields if field not in quant_config]
-            if missing_fields:
-                raise ValueError(
-                    f"NVFP4 quantization requires the following fields in " f"hf_quant_config.json: {missing_fields}"
-                )
-        return cls(
-            is_checkpoint_nvfp4_serialized=is_checkpoint_nvfp4_serialized,
-            kv_cache_quant_algo=kv_cache_quant_algo,
-            exclude_modules=exclude_modules,
-            group_size=group_size,
-        )
-
-    def get_quant_method(self, layer) -> Optional[QuantMethodBase]:
-        """
-        Get quantization method.
-        """
-        if isinstance(layer, FusedMoE):
-            if self.use_fp4_dispatch:
-                return ModelOptNvFp4FusedMoEDispatch(self)
-            else:
-                return ModelOptNvFp4FusedMoE(self)
-        else:
-            return ModelOptNvFp4LinearMethod(self)
-
-
-class ModelOptNvFp4LinearMethod(QuantMethodBase):
-    """Linear method for Model Optimizer NVFP4.
-    Supports loading NVFP4 checkpoints with the following structure:
-
-    input_scale: paddle.float32, scalar ,
-    weight: NVFP4(represented as byte) Shape: [1, X, y/2]
-    weight_scale: FP8-E4M3, Shape: [X, Y], aka per block scale,
-    weight_scale_2: paddle.float32, scalar,
-    Args: quant_config: The ModelOpt quantization config.
-    """
-
-    def __init__(self, quant_config: ModelOptNvFp4Config) -> None:
-        self.quant_config = quant_config
-
-        self.backend = "none"
-        if envs.FD_NVFP4_GEMM_BACKEND is None:
-            self.backend = "flashinfer-cutlass"
-        elif envs.FD_NVFP4_GEMM_BACKEND.startswith("flashinfer-"):
-            self.backend = envs.FD_NVFP4_GEMM_BACKEND
-
-        if self.backend == "none":
-            raise ValueError(
-                "No valid NVFP4 GEMM backend found. Please check your platform capability and installtion of Flashinfer."
-            )
-
-        logger.info(f"Using {self.backend} for NVFP4 GEMM")
-
-    def create_weights(
-        self,
-        layer,
-        **extra_weight_attrs,
-    ):
-        # 因为模型存储是列存储的，所以这里需要not一下！
-        extra_weight_attrs["output_dim"] = not extra_weight_attrs["output_dim"]
-        K = layer.weight_shape[0]
-        N = layer.weight_shape[1]
-        # 因为模型的存储时候权重是[N,K//2]
-        # 所以这里创建的权重是为了契合模型存储的权重！
-        weight_shape = [N, K // 2]
-        layer.weight_dtype = "uint8"
-
-        input_scale_shape = [1]
-        weight_scale_shape = [N, K // self.quant_config.group_size]
-        weight_scale_2_shape = [1]
-
-        self._create_main_weight(layer, weight_shape, extra_weight_attrs)
-        self._create_input_scale(layer, input_scale_shape)
-        self._create_weight_scales(layer, weight_scale_shape, weight_scale_2_shape, extra_weight_attrs)
-
-    def _create_main_weight(self, layer, weight_shape, extra_weight_attrs):
-        """创建主权重参数
-
-        参数:
-            layer: 当前层对象
-            weight_shape: 权重形状
-            extra_weight_attrs: 额外权重属性
-        """
-        layer.weight = layer.create_parameter(
-            shape=weight_shape,
-            dtype=layer.weight_dtype,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-        set_weight_attrs(
-            layer.weight,
-            extra_weight_attrs,
-        )
-
-    def _create_input_scale(self, layer, input_scale_shape):
-        """创建输入缩放参数
-
-        参数:
-            layer: 当前层对象
-            input_scale_shape: 输入缩放形状
-        """
-        layer.input_scale = layer.create_parameter(
-            shape=input_scale_shape,
-            dtype=paddle.float32,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-
-    def _create_weight_scales(self, layer, weight_scale_shape, weight_scale_2_shape, extra_weight_attrs):
-        """创建权重缩放参数
-
-        参数:
-            layer: 当前层对象
-            weight_scale_shape: 权重缩放形状
-            weight_scale_2_shape: 权重缩放2形状
-            extra_weight_attrs: 额外权重属性
-        """
-        layer.weight_scale = layer.create_parameter(
-            shape=weight_scale_shape,
-            dtype=paddle.float8_e4m3fn,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-        set_weight_attrs(
-            layer.weight_scale,
-            extra_weight_attrs,
-        )
-
-        layer.weight_scale_2 = layer.create_parameter(
-            shape=weight_scale_2_shape,
-            dtype=paddle.float32,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-
-    def process_weights_after_loading(self, layer) -> None:
-
-        input_scale_2 = layer.input_scale.max().to(paddle.float32)
-        weight_scale_2 = layer.weight_scale_2.max().to(paddle.float32)
-        alpha = input_scale_2 * weight_scale_2
-        input_scale_inv = (1 / input_scale_2).to(paddle.float32)
-        weight_scale_interleaved = _process_scale_interleaved(layer.weight_scale)
-        free_tensor(layer.input_scale)
-        free_tensor(layer.weight_scale_2)
-
-        layer.weight_scale_2 = layer.create_parameter(
-            shape=weight_scale_2.shape,
-            dtype=weight_scale_2.dtype,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-        layer.input_scale = layer.create_parameter(
-            shape=input_scale_2.shape,
-            dtype=input_scale_2.dtype,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-        layer.alpha = layer.create_parameter(
-            shape=alpha.shape,
-            dtype=alpha.dtype,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-        layer.input_scale_inv = layer.create_parameter(
-            shape=input_scale_inv.shape,
-            dtype=input_scale_inv.dtype,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-        layer.weight_scale_interleaved = layer.create_parameter(
-            shape=weight_scale_interleaved.shape,
-            dtype=weight_scale_interleaved.dtype,
-            is_bias=False,
-            default_initializer=paddle.nn.initializer.Constant(0),
-        )
-        layer.weight_scale_2.copy_(weight_scale_2, False)
-        layer.input_scale.copy_(input_scale_2, False)
-        layer.alpha.copy_(alpha, False)
-        layer.input_scale_inv.copy_(input_scale_inv, False)
-        layer.weight_scale_interleaved.copy_(weight_scale_interleaved, False)
-
-    def apply(
-        self,
-        layer,
-        x,
-    ):
-        x_m, _ = x.shape
-        w_n, _ = layer.weight.shape
-        output_shape = [x_m, w_n]
-        output_dtype = x.dtype
-
-        # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        from flashinfer import fp4_quantize
-
-        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
-
-        assert x_fp4.dtype == paddle.uint8
-        assert layer.weight.dtype == paddle.uint8
-        assert layer.weight_scale_interleaved.dtype == paddle.float8_e4m3fn
-        assert layer.alpha.dtype == paddle.float32
-
-        if self.backend.startswith("flashinfer-"):
-            backend = self.backend[len("flashinfer-") :]
-        else:
-            raise ValueError(f"Unsupported backend: {self.backend}.")
-
-        # shape 恢复到[K//2,N]
-        w = layer.weight.T
-        # shape 恢复到[K//group_size, N]
-        w_scale_interleaved = layer.weight_scale_interleaved.T
-
-        if backend == "cutlass":
-            x_scale_interleaved = x_scale_interleaved.view(paddle.uint8)
-            w_scale_interleaved = w_scale_interleaved.view(paddle.uint8)
-        from flashinfer import mm_fp4 as fp4_gemm
-
-        out = fp4_gemm(x_fp4, w, x_scale_interleaved, w_scale_interleaved, layer.alpha, output_dtype, backend=backend)
-        if layer.with_bias:
-            out = paddle.add(out, layer.bias)
-        assert out.shape == output_shape
-        return out
-
-
-class ModelOptNvFp4FusedMoE(MoEMethodBase):
+class ModelOptNvFp4FusedMoEDispatch(MoEMethodBase):
     """Fused MoE method for Model Optimizer NVFP4.
     Supports loading NVFP4 checkpoints with the following structure:
 
@@ -676,9 +286,30 @@ class ModelOptNvFp4FusedMoE(MoEMethodBase):
 
         if isinstance(hidden_states_3d, tuple) and hidden_states_3d[1] is not None:
             a_q = hidden_states_3d[0].view(paddle.uint8)
-            a_q_sf = hidden_states_3d[1].view(paddle.float8_e4m3fn)
             m, k_by_2, _ = a_q.shape
             k = k_by_2 * 2
+
+            # hidden_states_3d[1] is non-swizzled scale: [M, scale_dim, E] float8_e4m3fn
+            # grouped_gemm_nt_masked expects swizzled layout, so we must swizzle here.
+            from flashinfer import block_scale_interleave
+
+            sf_vec_size_local = 16
+            scale_dim = k // sf_vec_size_local  # e.g. 7168/16 = 448
+
+            # Transpose to [E, M, scale_dim] and view as uint8 for block_scale_interleave
+            a_q_sf_ems = hidden_states_3d[1].transpose([2, 0, 1]).contiguous().view(paddle.uint8)
+            # block_scale_interleave expects [E, M, scale_dim] uint8, returns flat swizzled buffer
+            swizzled_flat = block_scale_interleave(a_q_sf_ems)
+
+            # Reshape swizzled output to match scaled_fp4_grouped_quantize format:
+            # physical (E, rm, rk, 32, 4, 4) -> logical (32, 4, rm, 4, rk, E)
+            padded_k = (scale_dim + 3) // 4 * 4
+            padded_m = (m + 127) // 128 * 128
+            a_q_sf = (
+                swizzled_flat.view(paddle.float8_e4m3fn)
+                .reshape([num_experts, padded_m // 128, padded_k // 4, 32, 4, 4])
+                .transpose([3, 4, 1, 5, 2, 0])
+            )
         else:
             hidden_states = hidden_states_3d[0] if isinstance(hidden_states_3d, tuple) else hidden_states_3d
             _, m, k = hidden_states.shape
@@ -745,9 +376,30 @@ class ModelOptNvFp4FusedMoE(MoEMethodBase):
 
         from fastdeploy.model_executor.layers.moe.ep import deep_ep
 
+        # 1.5. Quantize x to NVFP4 before dispatch
+        # Compute a single global input scale (same for all experts in modelopt calibration)
+        input_scale_raw = layer.up_gate_proj_input_scale_quant.cast("float32")
+        if len(input_scale_raw.shape) == 0:
+            input_global_scale_single = input_scale_raw.reshape([1])
+        elif len(input_scale_raw.shape) == 1:
+            input_global_scale_single = input_scale_raw[:1]
+        elif len(input_scale_raw.shape) == 2 and input_scale_raw.shape[1] == 2:
+            input_global_scale_single = input_scale_raw.max(axis=1).values[:1].cast("float32")
+        else:
+            input_global_scale_single = input_scale_raw.reshape([-1])[:1]
+
+        from flashinfer import fp4_quantize
+
+        x_q_2d, x_q_sf_2d = fp4_quantize(x, input_global_scale_single, sf_vec_size=16, is_sf_swizzled_layout=False)
+        # x_q_2d layout: [num_tokens, hidden_packed], x_q_sf_2d layout: [num_tokens, sf_packed]
+
+        # Pack 4 uint8 scale factors into float32 (bit-preserving) to satisfy
+        # Deep EP's float32 dtype requirement without increasing communication volume.
+        x_q_sf_2d = x_q_sf_2d.view(paddle.float32)
+
         event = deep_ep.Buffer.capture()
 
-        # 2. ep dispatch
+        # 2. ep dispatch (dispatching NVFP4 quantized data)
         (
             recv_x,
             recv_topk_idx,
@@ -756,9 +408,10 @@ class ModelOptNvFp4FusedMoE(MoEMethodBase):
             handle,
             event,
         ) = self.ep_prefill_runner.dispatch(
-            x,
+            x_q_2d,
             topk_idx,
             topk_weights,
+            x_scale_tensor=x_q_sf_2d,
             expert_alignment=128,
             previous_event=event,
         )
@@ -766,9 +419,14 @@ class ModelOptNvFp4FusedMoE(MoEMethodBase):
         if self.ep_prefill_runner.ep_engine.async_finish:
             event.current_stream_wait()
 
-        # BF16 dispatch without scale or a tuple (FP8 dispatch)
+        # NVFP4 dispatch returns a tuple (quantized_value, block_scales)
         if isinstance(recv_x, tuple):
             recv_x_value, recv_x_scale = recv_x
+            # recv_x_value is uint8 (FP4 packed); view as float8_e4m3fn so that
+            # prefill_permute_to_masked_gemm CUDA kernel can dispatch correctly.
+            recv_x_value = recv_x_value.view(paddle.float8_e4m3fn)
+            # recv_x_scale stays float32 (packed from 4 uint8 before dispatch);
+            # prefill_permute_to_masked_gemm supports float32 scale dtype.
         else:
             recv_x_value = recv_x
             recv_x_scale = None
@@ -799,8 +457,19 @@ class ModelOptNvFp4FusedMoE(MoEMethodBase):
                     )
                 )
 
+                # Transpose from [num_experts, max_tokens, dim] to [max_tokens, dim, num_experts]
+                # to match the layout expected by grouped_gemm_nt_masked
+                permute_input_t = permute_input.transpose([1, 2, 0])
+                # Unpack float32 scale back to float8_e4m3fn (bit-preserving) before
+                # passing to grouped_gemm which expects 1-byte scale factors.
+                # Must view before transpose so the scale dim (not expert dim) is expanded.
+                permute_scale_t = permute_scale.contiguous().view(paddle.float8_e4m3fn).transpose([1, 2, 0])
+
                 # token_nums_per_expert: [num_local_experts, 1] -> [num_local_experts]
-                ffn_out = self._run_cutedsl_grouped_masked(layer, permute_input, token_nums_per_expert.reshape([-1]))
+                # Pass pre-quantized NVFP4 data as tuple to skip quantization inside
+                ffn_out = self._run_cutedsl_grouped_masked(
+                    layer, (permute_input_t, permute_scale_t), token_nums_per_expert.reshape([-1])
+                )
 
                 tmp_ffn_out = call_depermute_prefill_combine(
                     x=ffn_out,
@@ -828,16 +497,40 @@ class ModelOptNvFp4FusedMoE(MoEMethodBase):
                         [num_local_experts, max_expert_tokens, H],
                         dtype=recv_x_value.dtype,
                     )
+                    H_sf = recv_x_scale.shape[1] if recv_x_scale is not None else 0
+                    blocked_scale = (
+                        paddle.zeros(
+                            [num_local_experts, max_expert_tokens, H_sf],
+                            dtype=recv_x_scale.dtype,
+                        )
+                        if recv_x_scale is not None
+                        else None
+                    )
                     for ei, indices in enumerate(expert_token_lists):
                         if indices:
-                            blocked[ei, : len(indices)] = recv_x_value[paddle.to_tensor(indices, dtype=paddle.int64)]
+                            idx_tensor = paddle.to_tensor(indices, dtype=paddle.int64)
+                            blocked[ei, : len(indices)] = recv_x_value[idx_tensor]
+                            if blocked_scale is not None:
+                                blocked_scale[ei, : len(indices)] = recv_x_scale[idx_tensor]
                     masked_m = paddle.to_tensor(token_counts, dtype=paddle.int32)
-                    ffn_out_blocked = self._run_cutedsl_grouped_masked(layer, blocked, masked_m)
-                    # ffn_out_blocked: [num_local_experts, max_expert_tokens, H]
+
+                    # Transpose from [experts, tokens, dim] to [tokens, dim, experts]
+                    blocked_t = blocked.transpose([1, 2, 0])
+                    # Unpack float32 scale back to float8_e4m3fn (bit-preserving).
+                    # view before transpose so the scale dim is expanded correctly.
+                    blocked_scale_t = (
+                        blocked_scale.contiguous().view(paddle.float8_e4m3fn).transpose([1, 2, 0])
+                        if blocked_scale is not None
+                        else None
+                    )
+
+                    ffn_out_blocked = self._run_cutedsl_grouped_masked(layer, (blocked_t, blocked_scale_t), masked_m)
+                    # ffn_out_blocked: [num_local_experts, max_expert_tokens, H_out]
 
                     # De-permute: accumulate weighted expert outputs back to
-                    # [N_recv, H] in-place.
-                    tmp_ffn_out = paddle.zeros([recv_n, H], dtype=paddle.float32)
+                    # [N_recv, H_out] in-place.
+                    H_out = ffn_out_blocked.shape[2]
+                    tmp_ffn_out = paddle.zeros([recv_n, H_out], dtype=paddle.float32)
                     recv_topk_weights_np = recv_topk_weights.cast(paddle.float32).numpy()
                     ffn_out_f32 = ffn_out_blocked.cast(paddle.float32)
                     for ti in range(recv_n):
@@ -986,8 +679,3 @@ class ModelOptNvFp4FusedMoE(MoEMethodBase):
 
         # flashinfer-trtllm
         return paddle.empty_like(x)
-
-
-# ModelOptNvFp4FusedMoEDispatch is defined in nvfp4_ep.py.
-# Re-exported here so existing import paths remain unchanged.
-from .nvfp4_ep import ModelOptNvFp4FusedMoEDispatch  # noqa: F401, E402

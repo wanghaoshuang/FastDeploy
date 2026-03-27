@@ -365,6 +365,10 @@ class ModelOptNvFp4FusedMoEDispatch(MoEMethodBase):
         shared_experts: nn.Layer = None,
     ) -> paddle.Tensor:
 
+        logger.info(
+            f"[DEBUG apply_ep_prefill] entered, has ep_prefill_runner={hasattr(self, 'ep_prefill_runner')}, num_worst_tokens={getattr(self.ep_prefill_runner, 'num_worst_tokens', 'N/A') if hasattr(self, 'ep_prefill_runner') else 'N/A'}"
+        )
+
         # 1. top experts and weights
         gate_out = gate(x.cast("float32"))
         topk_idx, topk_weights = self.ep_prefill_runner.moe_select(layer, gate_out)
@@ -432,6 +436,9 @@ class ModelOptNvFp4FusedMoEDispatch(MoEMethodBase):
             recv_x_scale = None
 
         # 3. compute ffn
+        logger.info(
+            f"[DEBUG apply_ep_prefill] before branch: num_worst_tokens={self.ep_prefill_runner.num_worst_tokens}, recv_x_value.shape={recv_x_value.shape}"
+        )
         if self.ep_prefill_runner.num_worst_tokens > 0:
             top_k = layer.top_k
             num_local_experts = layer.num_local_experts
@@ -453,7 +460,7 @@ class ModelOptNvFp4FusedMoEDispatch(MoEMethodBase):
                         scale=recv_x_scale,
                         topk_ids=recv_topk_idx,
                         num_local_experts=num_local_experts,
-                        max_token_num=layer.ep_size * max_tokens_per_rank,
+                        max_token_num=layer.ep_size * max_tokens_per_rank * layer.top_k // num_local_experts,
                     )
                 )
 
@@ -619,6 +626,9 @@ class ModelOptNvFp4FusedMoEDispatch(MoEMethodBase):
         """
         flashinfer nvfp4 fusedmoe for Model Optimizer
         """
+        logger.info(
+            f"[DEBUG apply] backend={self.backend}, ep_size={layer.ep_size}, phase={layer.fd_config.model_config.moe_phase.phase}"
+        )
         if self.backend == "flashinfer-cutlass":
             gate_out = gate(x.cast("float32"))
             topk_ids, topk_weights = fastdeploy.model_executor.ops.gpu.moe_topk_select(
@@ -678,4 +688,5 @@ class ModelOptNvFp4FusedMoEDispatch(MoEMethodBase):
                 )
 
         # flashinfer-trtllm
+        logger.info("[DEBUG apply] FALLTHROUGH - no branch matched, returning empty_like")
         return paddle.empty_like(x)
